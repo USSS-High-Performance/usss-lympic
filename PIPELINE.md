@@ -65,36 +65,58 @@ carry (see README) — there's no local state to lose between runs anymore.
 ## Steps 5-6: per-event processing and upload — solved
 
 1. `GET /event/{eId}` → `Event ID` / `Session Name` / `Location` / `startedAt unix`
-   fields, shared by every athlete's entry for this event. `GET
-   /profile/{pId}/event/{eId}/alpine-skiing` → alpine-skiing-specific event
-   detail, wrapped as `{"status": ..., "event": {...}}`, mapped into the same
-   row-0 fields: `discipline` → `api_discipline`, `gateCount` → `Gate Count`,
-   `verticalDrop` → `Vertical Drop`, `airTemperature` → `Air Temp`,
-   `windSpeed` → `Wind Speed`, `humidity` → `Humidity`, `snowTemperature` →
-   `Snow Temp`.
-2. `GET /event/{eId}/alpine-skiing/group` → one row per run, via
-   `build_runs_dataframe()`. Sections are read from each run's `edges` list by
-   `sequence` (0/1/2/3/4 → Section 1/2/3/4/5); a run with no `sequence` match is
-   left blank, not zero. Runs with no assigned athlete (`profile` null/missing — an
-   unassigned DNF pulse) are dropped and logged, since there's no one to upload
-   them against. `_compute_event_fastest()` separately scans the *unfiltered*
-   run list (including unassigned runs) for the two remaining row-0 fields:
-   `Fastest Athlete` (the name off the fastest completed run's profile, or
-   `"Anon"` if that run has no profile/name; ties go to the later `startedAt`,
-   since a later run implies a rougher course and so a comparatively faster
-   time) and `Fastest Time` (that run's `totalDuration`, formatted the same
-   as `run_time`).
-3. Athletes within the event are grouped **by name** (`firstName`+`lastName`),
+   fields, shared by every athlete's entry for this event, plus the `module`
+   value that drives step 2.
+2. The event's `module` picks the group endpoint, via `GROUP_PATH_BY_MODULE` in
+   `run_pipeline.py`: `event:timing` → `GET /event/{eId}/timing/group`,
+   `event:alpine-skiing` → `GET /event/{eId}/alpine-skiing/group`. Both return
+   the same `{totalCount, records}` wrapper and the same record shape
+   (`id` / `startedAt` / `profile` / `status` / `totalDuration` / `invalid` plus an
+   inline `edges` list), so `build_runs_dataframe()` parses either one unchanged —
+   only the path segment differs. An event on any other module is logged as an
+   error and skipped; there's no runs endpoint here that knows how to read it.
+
+   Sections are read from each run's `edges` list by `sequence` (0/1/2/3/4 →
+   Section 1/2/3/4/5); a run with no `sequence` match is left blank, not zero.
+   The section count varies by event (timing events observed so far record 3),
+   and the Teamworks form tolerates the trailing blanks. A run is marked `DNF`
+   whenever `invalid` is present at all, whatever reason it names — alpine events
+   use `user_dnf`, timing events `duration_limit_max`. Runs with no assigned
+   athlete (`profile` null/missing) are dropped and logged, since there's no one
+   to upload them against; on a timing event that's the *common* case, where most
+   runs are recorded against a device `label` ("G5 AND") rather than a profile.
+
+   `_compute_event_fastest()` separately scans the *unfiltered* run list
+   (including unassigned runs) for two more row-0 fields: `Fastest Athlete` (the
+   name off the fastest completed run's profile, or `"Anon"` if that run has no
+   profile/name; ties go to the later `startedAt`, since a later run implies a
+   rougher course and so a comparatively faster time) and `Fastest Time` (that
+   run's `totalDuration`). Runs flagged `invalid` are excluded here as well as
+   runs with no `totalDuration` at all: an invalid run can still carry a
+   *partial* `totalDuration` covering only part of the course, which then beats
+   every completed run. A timing event showed this directly — a
+   `duration_limit_max` run recorded a single 12.3s section against a field of
+   ~35s completed runs, and won.
+3. Alpine-skiing events only: `GET /profile/{pId}/event/{eId}/alpine-skiing` →
+   alpine-specific event detail, wrapped as `{"status": ..., "event": {...}}`,
+   mapped into further row-0 fields: `discipline` → `api_discipline`,
+   `gateCount` → `Gate Count`, `verticalDrop` → `Vertical Drop`,
+   `airTemperature` → `Air Temp`, `windSpeed` → `Wind Speed`, `humidity` →
+   `Humidity`, `snowTemperature` → `Snow Temp`. A timing event has no such
+   record — requesting it there 404s — so those fields stay blank. The call is
+   made *after* the runs table is built, so an event with nothing to upload
+   can't fail on metadata it never needed.
+4. Athletes within the event are grouped **by name** (`firstName`+`lastName`),
    matched against Teamworks via `athlete_matching.match_athletes()`'s
    full-name → last-name → first-initial → full-first-name cascade (an exact
    first+last match is taken immediately when it's unique; only an
    unresolved/absent full-name match falls through to the last-name-first
    cascade). Unmatched athletes are logged as errors (with event id) and
    skipped, never guessed.
-4. Each matched athlete's runs are sorted earliest→latest, numbered into
+5. Each matched athlete's runs are sorted earliest→latest, numbered into
    `Run #` (1-indexed), and built into one event payload — event-level fields
    in `row: 0`, one table row per run after that.
-5. **All** athlete payloads across **every** event in the run are collected
+6. **All** athlete payloads across **every** event in the run are collected
    first, filtered against Teamworks' own existing entries (see Steps 2-3
    above), sorted oldest-first, and submitted together via
    `TeamworksClient.bulk_import_events()` (`POST /api/v1/eventsimport`),
@@ -103,7 +125,7 @@ carry (see README) — there's no local state to lose between runs anymore.
    no indication which one — so a batch failure automatically retries every
    event in it individually to isolate the cause; confirmed by test (see
    below).
-6. Every matched athlete's built payload is also written to
+7. Every matched athlete's built payload is also written to
    `debug_payloads/{event_id}__{teamworks_user_id}.json` (gitignored),
    alongside the raw Lympik data it was built from and a note on where each
    field came from. Written on every run, win or lose — a debugging aid for
