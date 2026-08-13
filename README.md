@@ -1,7 +1,9 @@
 # usss-lympic
 
-Pulls alpine-skiing timing data out of Lympik and uploads it into Teamworks AMS,
-one "Lympik Event" form entry per athlete per training session.
+Pulls timing data out of Lympik and uploads it into Teamworks AMS, one "Lympik
+Event" form entry per athlete per training session. Handles both of Lympik's
+timed event modules — `event:timing` and `event:alpine-skiing` — since a session
+recorded on either one produces the same runs-and-sections data.
 
 ## The flow, in order
 
@@ -10,10 +12,19 @@ one "Lympik Event" form entry per athlete per training session.
 2. **Get the Teamworks athlete roster.** Calls Teamworks' `/api/v1/usersynchronise`
    to fetch every athlete the API account can see.
 3. **For each Lympik event:**
-   - Pull the event's own details (name, location, start time) from `/event/{eId}`.
-   - Pull every run in that event from `/event/{eId}/alpine-skiing/group`, and turn
-     them into a table: one row per run, with each run's athlete, start time,
-     splits, total time, and DNF status.
+   - Pull the event's own details (name, location, start time, `module`) from
+     `/event/{eId}`.
+   - Read that `module` to pick the run endpoint: `event:timing` →
+     `/event/{eId}/timing/group`, `event:alpine-skiing` →
+     `/event/{eId}/alpine-skiing/group`. Any other module is logged and skipped.
+     An alpine event also has extra event detail (discipline, gate count,
+     vertical drop, weather) at `/profile/{pId}/event/{eId}/alpine-skiing`; those
+     row-0 fields are left blank for a timing event, which has no such record.
+   - Turn every run in that event into a table: one row per run, with each run's
+     athlete, start time, sections, total time, and DNF status. The number of
+     sections varies by event, so unused Section columns are left blank. A run
+     counts as DNF whenever Lympik flagged it `invalid`, whatever reason it gave
+     (`user_dnf` on alpine events, `duration_limit_max` on timing events).
    - Group that table by athlete name, and match each Lympik athlete name against
      the Teamworks roster (last name → first initial → full first name — see
      `athlete_matching.py`). An athlete with no confident match gets logged as an

@@ -37,6 +37,16 @@ FORM_NAME = "Lympik Event"
 EVENT_ID_FIELD = "Event ID"
 DEBUG_DUMP_DIR = Path("debug_payloads")
 
+# Which group endpoint a run list comes from, keyed by the `module` value on
+# the event detail payload (GET /event/{eId}). Both modules return the same
+# record shape, so one parser covers both -- only the path segment differs.
+# An event on any other module is skipped: there's no runs endpoint here that
+# knows how to read it.
+GROUP_PATH_BY_MODULE = {
+    "event:timing": "timing",
+    "event:alpine-skiing": "alpine-skiing",
+}
+
 RUNS_DF_COLUMNS = [
     "firstName",
     "lastName",
@@ -68,16 +78,32 @@ def _unix_to_ams_date_time(unix_ts, tz):
     return dt.strftime("%d/%m/%Y"), dt.strftime("%I:%M %p").lstrip("0")
 
 
-def build_runs_dataframe(lympik_client, event_id):
-    """/event/{eId}/alpine-skiing/group -> one row per run. Runs with no
-    assigned athlete (profile null/missing -- e.g. an unassigned DNF pulse)
-    are dropped and logged, since there's no athlete to upload them against.
+def build_runs_dataframe(lympik_client, event_id, module_path):
+    """/event/{eId}/{module_path}/group -> one row per run, where module_path
+    is "timing" or "alpine-skiing" per the event's own `module` (see
+    GROUP_PATH_BY_MODULE). Both modules return the same record shape --
+    id/startedAt/profile/status/totalDuration/invalid plus an inline `edges`
+    list -- so one parser covers both.
+
+    Runs with no assigned athlete (profile null/missing) are dropped and
+    logged, since there's no athlete to upload them against. On a timing
+    event that's the common case rather than the exception: most runs there
+    are recorded against a device `label` ("G5 AND") instead of a profile.
+
+    A run counts as DNF whenever the API set `invalid` at all, whatever the
+    reason it gave -- alpine events use `user_dnf`, timing events
+    `duration_limit_max`, and any reason code either module adds later should
+    count the same way.
+
+    The number of sections varies by event (timing events seen so far record
+    3), so Section columns past the last `sequence` present are left blank
+    rather than zero; the Teamworks form tolerates the blanks.
 
     Returns (dataframe, raw_groups) -- raw_groups is the unprocessed API
     response for every run (including dropped ones), kept around purely so
     build_athlete_payloads() can include it in a debug dump; nothing in the
     upload path itself uses it."""
-    groups = list(lympik_client.get_all_pages(f"/event/{event_id}/alpine-skiing/group"))
+    groups = list(lympik_client.get_all_pages(f"/event/{event_id}/{module_path}/group"))
 
     rows = []
     for group in groups:
@@ -100,7 +126,7 @@ def build_runs_dataframe(lympik_client, event_id):
                 "Section 4": splits.get(3),
                 "Section 5": splits.get(4),
                 "run_time": group.get("totalDuration"),
-                "DNF": group.get("invalid") == "user_dnf",
+                "DNF": group.get("invalid") is not None,
             }
         )
 
@@ -109,14 +135,21 @@ def build_runs_dataframe(lympik_client, event_id):
 
 def _compute_event_fastest(raw_groups):
     """Fastest completed run across the whole event -- every run returned by
-    /event/{eId}/alpine-skiing/group, not just the ones with a Teamworks
-    match, since this is a fact about the event, not about who it's uploaded
-    for. A run with no totalDuration (DNF/invalid) is excluded. Ties go to
-    the later startedAt: a later run means a rougher course and so a
-    comparatively faster time. Returns ("Anon", time) if the fastest run's
-    profile has no name (or no profile at all), or (None, None) if the event
-    has no completed runs."""
-    completed = [g for g in raw_groups if g.get("totalDuration") is not None]
+    the module's group endpoint, not just the ones with a Teamworks match,
+    since this is a fact about the event, not about who it's uploaded for.
+
+    A run is excluded if it has no totalDuration *or* if the API flagged it
+    `invalid` at all: an invalid run can still carry a partial totalDuration,
+    and since that partial time covers only part of the course it beats every
+    completed run outright. A timing event showed this directly -- a
+    `duration_limit_max` run recorded a single 12.3s section against a field
+    of ~35s completed runs, and won.
+
+    Ties go to the later startedAt: a later run means a rougher course and so
+    a comparatively faster time. Returns ("Anon", time) if the fastest run's
+    profile has no name (or no profile at all -- a device-labelled run), or
+    (None, None) if the event has no completed runs."""
+    completed = [g for g in raw_groups if g.get("totalDuration") is not None and g.get("invalid") is None]
     if not completed:
         return None, None
 
@@ -129,7 +162,7 @@ def _compute_event_fastest(raw_groups):
     return name, fastest["totalDuration"]
 
 
-def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, event, alpine_event, event_fields, raw_groups, raw_athlete_groups, athlete_runs_df, ams_event):
+def _write_debug_payload(event_id, module, teamworks_user_id_value, lympik_profile, event, alpine_event, event_fields, raw_groups, raw_athlete_groups, athlete_runs_df, ams_event):
     """Dumps exactly what would be (or was) sent to Teamworks for this
     athlete+event, alongside the raw Lympik data it was built from and a
     note on where every field came from -- so a mismatch (wrong value,
@@ -138,6 +171,7 @@ def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, even
     outcome; each file is overwritten by the next run that touches the same
     (event, athlete) pair, since this is a debugging aid, not a record."""
     DEBUG_DUMP_DIR.mkdir(exist_ok=True)
+    group_path = GROUP_PATH_BY_MODULE.get(module, module)
 
     dump = {
         "_pipeline_note": (
@@ -147,6 +181,7 @@ def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, even
             "be traced back to its source."
         ),
         "event_id": event_id,
+        "lympik_event_module": module,
         "teamworks_user_id": teamworks_user_id_value,
         "lympik_athlete_name": f"{lympik_profile['firstName']} {lympik_profile['lastName']}",
         "raw_lympik_event": {
@@ -154,15 +189,19 @@ def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, even
             "data": event,
         },
         "raw_lympik_alpine_skiing_event": {
-            "_source": f"GET /profile/{{pId}}/event/{event_id}/alpine-skiing",
+            "_source": (
+                f"GET /profile/{{pId}}/event/{event_id}/alpine-skiing"
+                if module == "event:alpine-skiing"
+                else f"not fetched -- only event:alpine-skiing has this record, this event is {module}"
+            ),
             "data": alpine_event,
         },
         "raw_lympik_runs_for_this_athlete": {
-            "_source": f"GET /event/{event_id}/alpine-skiing/group, filtered to this athlete's name",
+            "_source": f"GET /event/{event_id}/{group_path}/group, filtered to this athlete's name",
             "data": raw_athlete_groups,
         },
         "raw_lympik_all_runs_in_event": {
-            "_source": f"GET /event/{event_id}/alpine-skiing/group, unfiltered -- source for Fastest Athlete/Fastest Time",
+            "_source": f"GET /event/{event_id}/{group_path}/group, unfiltered -- source for Fastest Athlete/Fastest Time",
             "data": raw_groups,
         },
         "extracted_event_fields": {
@@ -172,14 +211,14 @@ def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, even
                 "Session Name": "event['name']",
                 "Location": "event['locationName']",
                 "startedAt unix": "event['startedAt']",
-                "api_discipline": "alpine_event['discipline']",
-                "Gate Count": "alpine_event['gateCount']",
-                "Vertical Drop": "alpine_event['verticalDrop']",
-                "Air Temp": "alpine_event['airTemperature']",
-                "Wind Speed": "alpine_event['windSpeed']",
-                "Humidity": "alpine_event['humidity']",
-                "Snow Temp": "alpine_event['snowTemperature']",
-                "Fastest Athlete": "_compute_event_fastest(raw_groups) -- min totalDuration across all runs in the event, ties broken by later startedAt, 'Anon' if no profile name",
+                "api_discipline": "alpine_event['discipline'] -- blank unless module is event:alpine-skiing",
+                "Gate Count": "alpine_event['gateCount'] -- blank unless module is event:alpine-skiing",
+                "Vertical Drop": "alpine_event['verticalDrop'] -- blank unless module is event:alpine-skiing",
+                "Air Temp": "alpine_event['airTemperature'] -- blank unless module is event:alpine-skiing",
+                "Wind Speed": "alpine_event['windSpeed'] -- blank unless module is event:alpine-skiing",
+                "Humidity": "alpine_event['humidity'] -- blank unless module is event:alpine-skiing",
+                "Snow Temp": "alpine_event['snowTemperature'] -- blank unless module is event:alpine-skiing",
+                "Fastest Athlete": "_compute_event_fastest(raw_groups) -- min totalDuration across all runs in the event that aren't flagged `invalid`, ties broken by later startedAt, 'Anon' if no profile name",
                 "Fastest Time": "_compute_event_fastest(raw_groups) -- the winning run's totalDuration",
             },
             "data": event_fields,
@@ -189,9 +228,9 @@ def _write_debug_payload(event_id, teamworks_user_id_value, lympik_profile, even
             "field_sources": {
                 "Run ID": "group['id']",
                 "Run Start unix Time": "group['startedAt']",
-                "Section 1-5": "group['edges'], matched by edge['sequence'] == 0/1/2/3/4, value is edge['duration']",
+                "Section 1-5": "group['edges'], matched by edge['sequence'] == 0/1/2/3/4, value is edge['duration'] -- blank past the last sequence the event actually recorded",
                 "run_time": "group['totalDuration']",
-                "DNF": "group['invalid'] == 'user_dnf'",
+                "DNF": "group['invalid'] is present at all, whatever reason it gives ('user_dnf', 'duration_limit_max', ...)",
             },
             "data": athlete_runs_df.to_dict("records"),
         },
@@ -253,28 +292,50 @@ def build_athlete_payloads(lympik_client, teamworks_athletes, event_id, tz):
     filtered against the ledger or uploaded yet, since run() collects these
     across every event in the run, filters, and submits them together in as
     few eventsimport batches as possible. Unmatched athletes are logged as
-    errors (with the event id) and skipped, never guessed."""
+    errors (with the event id) and skipped, never guessed.
+
+    The event's own `module` (off GET /event/{eId}) decides which group
+    endpoint the runs come from -- see GROUP_PATH_BY_MODULE. An event on any
+    other module is logged and skipped rather than guessed at. Only
+    `event:alpine-skiing` has the extra alpine-skiing event detail record, so
+    the alpine-specific row-0 fields are left blank on a timing event; asking
+    for that record on a timing event is what used to 404 the whole event."""
     event = lympik_client.get(f"/event/{event_id}")
-    alpine_event = lympik_client.get_alpine_skiing_event(event_id).get("event") or {}
+    module = event.get("module")
+    module_path = GROUP_PATH_BY_MODULE.get(module)
+    if module_path is None:
+        logger.error("event %s: unsupported module %r, skipping", event_id, module)
+        return []
+
     event_fields = {
         "Event ID": event["id"],
         "Session Name": event.get("name"),
         "Location": event.get("locationName"),
         "startedAt unix": event.get("startedAt"),
-        "api_discipline": alpine_event.get("discipline"),
-        "Gate Count": alpine_event.get("gateCount"),
-        "Vertical Drop": alpine_event.get("verticalDrop"),
-        "Air Temp": alpine_event.get("airTemperature"),
-        "Wind Speed": alpine_event.get("windSpeed"),
-        "Humidity": alpine_event.get("humidity"),
-        "Snow Temp": alpine_event.get("snowTemperature"),
     }
     start_date, start_time = _unix_to_ams_date_time(event["startedAt"], tz)
 
-    runs_df, raw_groups = build_runs_dataframe(lympik_client, event_id)
+    runs_df, raw_groups = build_runs_dataframe(lympik_client, event_id, module_path)
     if runs_df.empty:
         logger.info("event %s: no assigned runs, nothing to upload", event_id)
         return []
+
+    # Fetched after the runs check, so an event with nothing to upload can't
+    # fail on metadata it never needed.
+    alpine_event = {}
+    if module == "event:alpine-skiing":
+        alpine_event = lympik_client.get_alpine_skiing_event(event_id).get("event") or {}
+    event_fields.update(
+        {
+            "api_discipline": alpine_event.get("discipline"),
+            "Gate Count": alpine_event.get("gateCount"),
+            "Vertical Drop": alpine_event.get("verticalDrop"),
+            "Air Temp": alpine_event.get("airTemperature"),
+            "Wind Speed": alpine_event.get("windSpeed"),
+            "Humidity": alpine_event.get("humidity"),
+            "Snow Temp": alpine_event.get("snowTemperature"),
+        }
+    )
 
     fastest_athlete, fastest_time = _compute_event_fastest(raw_groups)
     event_fields["Fastest Athlete"] = fastest_athlete
@@ -326,6 +387,7 @@ def build_athlete_payloads(lympik_client, teamworks_athletes, event_id, tz):
         ]
         _write_debug_payload(
             event_id,
+            module,
             teamworks_user_id(teamworks_athlete),
             lympik_profile,
             event,
