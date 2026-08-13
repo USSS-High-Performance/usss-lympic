@@ -4,7 +4,7 @@ upsert change depends on and that no amount of local testing can settle:
 1. What does `POST /api/v1/synchronise` actually return on *this* AMS
    instance, and specifically which key holds the **Teamworks** event id?
    The current shape in `teamworks_client.py` is confirmed only against a
-   different org, and `find_existing_event_ids()` never needed the Teamworks
+   different org, and `find_existing_events()` never needed the Teamworks
    id before -- the upsert does, since that id is the `existingEventId` an
    update has to send.
 2. Does `/api/v1/eventsimport` (plural, what this pipeline batches through)
@@ -206,7 +206,7 @@ def build_payload(user_id, event_fields, runs_df, tz, started_at, existing_event
 
 def synchronise(client, user_id, start_date):
     """Raw paginated /api/v1/synchronise, without any of the parsing
-    find_existing_event_ids() layers on top -- the point is to see the
+    find_existing_events() layers on top -- the point is to see the
     unfiltered truth."""
     pages = []
     cursor = None
@@ -232,7 +232,7 @@ def synchronise(client, user_id, start_date):
 
 
 def events_from_pages(pages):
-    """Where find_existing_event_ids() expects events to live. Reported
+    """Where find_existing_events() expects events to live. Reported
     separately from the raw dump so a shape mismatch is obvious rather than
     inferred."""
     events = []
@@ -287,7 +287,7 @@ def report_shape(pages, fake_event_id, teamworks_event_id):
     events = events_from_pages(pages)
     print(f"\nevents found under $.export.events: {len(events)}")
     if not events:
-        print("!! find_existing_event_ids() looks for $.export.events -- nothing there.")
+        print("!! find_existing_events() looks for $.export.events -- nothing there.")
         print("!! Paths where the probe's own values DO appear (this is where the parser should look):")
         for label, target in (("Lympik Event ID", fake_event_id), ("Teamworks event id", teamworks_event_id)):
             for page_index, page in enumerate(pages):

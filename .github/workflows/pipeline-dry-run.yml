@@ -1,0 +1,36 @@
+name: Pipeline dry run (no writes)
+
+# Runs the real pipeline with PIPELINE_DRY_RUN=1: reads Lympik, builds every
+# payload, resolves create-vs-update against live Teamworks, logs the plan, and
+# writes nothing to AMS.
+#
+# TEMPORARY push trigger, same reason as probe-upsert.yml: workflow_dispatch
+# only registers for workflows already on the default branch, so a new workflow
+# on a feature branch can't be dispatched. Scoped to `.dryrun-trigger` so it
+# fires only when that file is deliberately touched. Remove the `push:` block
+# and `.dryrun-trigger` before merging; workflow_dispatch is the permanent
+# entry point once this is on main.
+on:
+  push:
+    branches:
+      - claude/lympik-alpine-skiing-404-3vngw0
+    paths:
+      - .dryrun-trigger
+  workflow_dispatch: {}
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python run_pipeline.py
+        env:
+          PIPELINE_DRY_RUN: "1"
+          LYMPIK_PROFILE_ID: ${{ secrets.LYMPIK_PROFILE_ID }}
+          LYMPIK_API_KEY: ${{ secrets.LYMPIK_API_KEY }}
+          TEAMWORKS_USERNAME: ${{ secrets.TEAMWORKS_USERNAME }}
+          TEAMWORKS_PASSWORD: ${{ secrets.TEAMWORKS_PASSWORD }}

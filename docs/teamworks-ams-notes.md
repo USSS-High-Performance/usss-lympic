@@ -72,6 +72,24 @@ the following is confirmed by live testing, not just docs.
 - `existingEventId` (from `ids[0]` of a prior create) **replaces the entire event's
   contents** — it does not append or merge. If you're updating an event, resend the
   full desired state, not a delta; anything you omit is not guaranteed to survive.
+- **`existingEventId` works on the plural `/api/v1/eventsimport` too**, not just the
+  singular endpoint that documents it — confirmed live. Set it per event object
+  inside `events`. An int works; the doc example's `""` for "create" is equivalent to
+  omitting the key.
+- **An update returns the same event id it replaced.** This is the only way to tell
+  an update from an accidental create: `eventsimport` reports
+  `SUCCESSFULLY_IMPORTED` either way, so if the returned id differs from the
+  `existingEventId` you sent, it created a duplicate. Check every update's returned
+  id against what you sent.
+- **Calculated fields survive a full replace.** A form's derived fields are
+  recomputed from the values you send rather than being wiped by the replace, so
+  "resend full state" means *your* fields, not the form's. Confirmed live on a form
+  carrying twelve such fields — copies of a sent field under a different name, a URL
+  built from an id, a stripped/normalized version of a text field, reformatted
+  numbers, aggregates over the table rows (count, sum, count and % of a boolean
+  column), and rolling multi-event calcs. All recomputed correctly after an update;
+  none were lost. Note that a derived field whose source is empty may simply not
+  appear, and **fields you send as `""` are dropped from the response entirely**.
 
 **Forms with single-value ("event") fields + a repeating table — the shape that works:**
 

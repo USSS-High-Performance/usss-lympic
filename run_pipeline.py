@@ -3,18 +3,36 @@
 Scheduling/interval is left to whatever runs this script (cron, a scheduled
 task, etc.) -- this module is a single run.
 
-Duplicate protection: before uploading, run() asks Teamworks itself which
-(Lympik event, Teamworks athlete) pairs already have a "Lympik Event" entry,
-via TeamworksClient.find_existing_event_ids() (POST /api/v1/synchronise,
-matching our own "Event ID" row-0 field against the event ids this run is
-about to process). This replaced an earlier local JSON ledger stopgap --
-querying Teamworks directly means no local state file to lose or fall out
-of sync, and it also sees entries created any other way (a manual entry, a
-different script). See PIPELINE.md for why the ledger existed and how this
-replaced it, and docs/teamworks-api-reference.md for the endpoint itself.
-Since this endpoint's response shape isn't yet confirmed against this
-specific AMS instance, every call dumps its raw response to
-debug_payloads/synchronise_response.json for verification.
+Upsert, not skip: a Lympik session can be read while it's still in progress,
+so an event this pipeline already uploaded will keep gaining runs. Every
+athlete-session inside the lookback window is therefore re-sent on every run,
+updating the existing Teamworks entry in place rather than being skipped as a
+duplicate (which is what an earlier version did, freezing an entry at whatever
+the session looked like the first time it was seen).
+
+run() asks Teamworks itself which (Lympik event, Teamworks athlete) pairs
+already have a "Lympik Event" entry and what each one's Teamworks event id is,
+via TeamworksClient.find_existing_events() (POST /api/v1/synchronise, matching
+our own "Event ID" row-0 field against the event ids this run is about to
+process). A pair that comes back gets that id as `existingEventId`, which
+replaces the entry; a pair that doesn't is created. There's no local ledger to
+lose or fall out of sync, and entries created any other way are seen too.
+
+Re-sending everything in the window is deliberate rather than wasteful. The
+row-0 "Fastest Athlete"/"Fastest Time" fields are event-wide, so when any
+athlete posts a new best every *other* athlete's entry for that session is
+stale and needs rewriting too, not just the one whose runs changed.
+
+Whole-event replacement is safe here, confirmed live by probe_upsert.py:
+`existingEventId` replaces an event's contents rather than merging, and this
+form carries a dozen fields the pipeline never sends (Discipline, Run Time,
+Total Runs, Session Total Time (s), # DNF, Session % DNF, Period, Date Year,
+Period Calc Number, 7 Day Total Time in Course, Lympik Activity URL,
+name_stripped). All of them are AMS-side derivations that recompute after an
+update -- nothing present after a create was missing after an update.
+
+Every synchronise call dumps its raw response, plus the create/update plan it
+produced, to debug_payloads/synchronise_response.json.
 """
 
 import json
@@ -244,21 +262,30 @@ def _write_debug_payload(event_id, module, teamworks_user_id_value, lympik_profi
     path.write_text(json.dumps(dump, indent=2, default=str))
 
 
-def _write_debug_synchronise_response(raw_responses, existing_pairs):
-    """Dumps the raw /api/v1/synchronise response(s) used for duplicate
-    detection this run, plus what we parsed out of them -- this endpoint's
-    response shape is confirmed against a different AMS org, not this one,
-    so this is the way to confirm/fix event_id/user_id extraction if
-    find_existing_event_ids() isn't finding what it should."""
+def _write_debug_synchronise_response(existing, plan):
+    """Dumps the raw /api/v1/synchronise response(s) this run's upsert
+    decisions were made from, what was parsed out of them, and the resulting
+    per-athlete create/update plan -- so a wrong decision (updated the wrong
+    entry, created a duplicate, skipped an update) can be traced to the
+    response that caused it.
+
+    Note the per-athlete payload dumps are written earlier, while payloads are
+    being built, so they show each event *before* an existingEventId was
+    attached. The plan here is the record of what was actually sent."""
     DEBUG_DUMP_DIR.mkdir(exist_ok=True)
     dump = {
         "_pipeline_note": (
-            "Debug dump only. Raw POST /api/v1/synchronise response(s) used to find "
-            "which (event, athlete) pairs already exist in Teamworks this run, plus "
-            "what find_existing_event_ids() parsed out of them."
+            "Debug dump only. Raw POST /api/v1/synchronise response(s) used to decide "
+            "create-vs-update for each athlete-session this run, what "
+            "find_existing_events() parsed out of them, and the resulting plan."
         ),
-        "raw_responses": raw_responses,
-        "parsed_existing_pairs": sorted(existing_pairs),
+        "events_seen": existing.events_seen,
+        "events_parsed": existing.events_parsed,
+        "parsed_existing_pairs": {
+            f"event={event_id} user={user_id}": ids for (event_id, user_id), ids in sorted(existing.by_pair.items())
+        },
+        "plan": plan,
+        "raw_responses": existing.raw_responses,
     }
     (DEBUG_DUMP_DIR / "synchronise_response.json").write_text(json.dumps(dump, indent=2, default=str))
 
@@ -288,11 +315,12 @@ def _build_rows_payload(event_fields, athlete_runs_df):
 
 def build_athlete_payloads(lympik_client, teamworks_athletes, event_id, tz):
     """Returns a list of {"event_id", "teamworks_user_id", "lympik_profile",
-    "ams_event"} dicts, one per matched athlete in this Lympik event -- not
-    filtered against the ledger or uploaded yet, since run() collects these
-    across every event in the run, filters, and submits them together in as
-    few eventsimport batches as possible. Unmatched athletes are logged as
-    errors (with the event id) and skipped, never guessed.
+    "ams_event"} dicts, one per matched athlete in this Lympik event. Not
+    resolved to create-vs-update or uploaded yet -- run() collects these across
+    every event in the run, attaches an existingEventId to the ones Teamworks
+    already holds, and submits them together in as few eventsimport batches as
+    possible. Unmatched athletes are logged as errors (with the event id) and
+    skipped, never guessed.
 
     The event's own `module` (off GET /event/{eId}) decides which group
     endpoint the runs come from -- see GROUP_PATH_BY_MODULE. An event on any
@@ -411,7 +439,7 @@ def build_athlete_payloads(lympik_client, teamworks_athletes, event_id, tz):
     return payloads
 
 
-def run(lympik_client, teamworks_client, since_unix, tz):
+def run(lympik_client, teamworks_client, since_unix, tz, dry_run=False):
     event_ids = get_recent_event_ids(lympik_client, since_unix)
     logger.info("%d recent event(s) in window", len(event_ids))
 
@@ -428,51 +456,154 @@ def run(lympik_client, teamworks_client, since_unix, tz):
         logger.info("nothing to upload")
         return
 
-    # Ask Teamworks itself which of these (event, athlete) pairs already
-    # have a "Lympik Event" entry -- see module docstring. start_date is
-    # the earliest date any of this run's events could fall on, per the
-    # same lookback window used to find them.
+    # Ask Teamworks itself which of these (event, athlete) pairs already have a
+    # "Lympik Event" entry, and what each one's Teamworks event id is -- see
+    # module docstring. start_date is the earliest date any of this run's
+    # events could fall on, per the same lookback window used to find them.
     start_date, _ = _unix_to_ams_date_time(since_unix, tz)
-    existing_pairs, raw_synchronise_responses = teamworks_client.find_existing_event_ids(
+    existing = teamworks_client.find_existing_events(
         form_name=FORM_NAME,
         start_date=start_date,
         user_ids=sorted({p["teamworks_user_id"] for p in all_payloads}),
         event_id_field=EVENT_ID_FIELD,
         candidate_event_ids={p["event_id"] for p in all_payloads},
     )
-    _write_debug_synchronise_response(raw_synchronise_responses, existing_pairs)
 
-    pending = [p for p in all_payloads if (str(p["event_id"]), str(p["teamworks_user_id"])) not in existing_pairs]
+    # Events came back but not one of them could be addressed, so the lookup
+    # is broken rather than empty. Creating here would add a duplicate of
+    # every entry in the window, and would do it again every 30 minutes, so
+    # this run stops instead. Nothing is lost -- a genuinely new session gets
+    # created on the next run once the lookup works again.
+    if existing.events_seen and not existing.events_parsed:
+        logger.error(
+            "aborting before upload: synchronise returned %d event(s) but none could be "
+            "matched to an athlete and event id, so existing entries cannot be found. "
+            "Uploading now would duplicate every entry in the window. See "
+            "debug_payloads/synchronise_response.json",
+            existing.events_seen,
+        )
+        _write_debug_synchronise_response(existing, plan=[])
+        return
+
+    plan = []
+    for payload in all_payloads:
+        pair = (str(payload["event_id"]), str(payload["teamworks_user_id"]))
+        existing_ids = existing.by_pair.get(pair, [])
+        profile = payload["lympik_profile"]
+        athlete_label = f"{profile['firstName']} {profile['lastName']}"
+
+        if existing_ids:
+            # Lowest id wins, deterministically. More than one means AMS
+            # already holds duplicates for this pair (from an earlier import
+            # or a manual entry) -- updating one and naming the rest is the
+            # honest option; deleting another system's records isn't this
+            # pipeline's call.
+            payload["ams_event"]["existingEventId"] = existing_ids[0]
+            payload["action"] = "update"
+            if len(existing_ids) > 1:
+                logger.warning(
+                    "event %s: %s has %d existing Teamworks entries %s -- updating the lowest (%s); "
+                    "the others are duplicates and need deleting by hand in AMS",
+                    payload["event_id"],
+                    athlete_label,
+                    len(existing_ids),
+                    existing_ids,
+                    existing_ids[0],
+                )
+        else:
+            payload["action"] = "create"
+
+        plan.append(
+            {
+                "event_id": payload["event_id"],
+                "athlete": athlete_label,
+                "teamworks_user_id": payload["teamworks_user_id"],
+                "action": payload["action"],
+                "existingEventId": payload["ams_event"].get("existingEventId"),
+                "other_existing_ids": existing_ids[1:],
+            }
+        )
+
+    _write_debug_synchronise_response(existing, plan)
+
+    updates = [p for p in all_payloads if p["action"] == "update"]
     logger.info(
-        "%d athlete-session(s) to upload (%d already in Teamworks)", len(pending), len(all_payloads) - len(pending)
+        "%d athlete-session(s) to send: %d update(s), %d create(s)",
+        len(all_payloads),
+        len(updates),
+        len(all_payloads) - len(updates),
     )
+
+    if dry_run:
+        for entry in plan:
+            logger.info(
+                "DRY RUN: would %s event %s for %s (existingEventId=%s)",
+                entry["action"],
+                entry["event_id"],
+                entry["athlete"],
+                entry["existingEventId"],
+            )
+        logger.info("DRY RUN: nothing was sent to Teamworks")
+        return
 
     # Oldest-first, per Teamworks' own eventsimport sample ("minimise
     # re-running historical calcs").
-    pending.sort(key=lambda p: p["sort_key"])
+    all_payloads.sort(key=lambda p: p["sort_key"])
 
-    results = teamworks_client.bulk_import_events([p["ams_event"] for p in pending])
+    results = teamworks_client.bulk_import_events([p["ams_event"] for p in all_payloads])
 
-    for payload, (_, teamworks_event_id, error) in zip(pending, results):
+    for payload, (_, teamworks_event_id, error) in zip(all_payloads, results):
         profile = payload["lympik_profile"]
         athlete_label = f"{profile['firstName']} {profile['lastName']}"
+        action = payload["action"]
+
         if error is not None:
-            logger.error("event %s: upload failed for %s: %s", payload["event_id"], athlete_label, error)
-        else:
-            logger.info("event %s: uploaded %s -> Teamworks event %s", payload["event_id"], athlete_label, teamworks_event_id)
+            logger.error("event %s: %s failed for %s: %s", payload["event_id"], action, athlete_label, error)
+            continue
+
+        # An update must come back as the same event it replaced. A different
+        # id means eventsimport ignored existingEventId and created a second
+        # entry -- it reports success either way, so this is the only place
+        # that failure is visible.
+        sent_id = payload["ams_event"].get("existingEventId")
+        if action == "update" and str(teamworks_event_id) != str(sent_id):
+            logger.error(
+                "event %s: update for %s was sent with existingEventId=%s but Teamworks returned "
+                "event %s -- it created a duplicate instead of updating; entry %s needs deleting by hand",
+                payload["event_id"],
+                athlete_label,
+                sent_id,
+                teamworks_event_id,
+                teamworks_event_id,
+            )
+            continue
+
+        logger.info(
+            "event %s: %sd %s -> Teamworks event %s", payload["event_id"], action, athlete_label, teamworks_event_id
+        )
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    # One day back, deliberately short: the upsert re-sends everything in this
+    # window on every run, and a Lympik session never spans more than a day.
     since_unix = int(time.time() - 86400)
     tz = ZoneInfo(os.environ.get("PIPELINE_TIMEZONE", "America/Denver"))
+
+    # PIPELINE_DRY_RUN=1 does everything except the upload: reads Lympik,
+    # builds every payload, resolves create-vs-update against Teamworks, writes
+    # the debug dumps, and logs the plan. Nothing is written to AMS.
+    dry_run = os.environ.get("PIPELINE_DRY_RUN") == "1"
+    if dry_run:
+        logger.info("PIPELINE_DRY_RUN=1 -- resolving the full plan but sending nothing to Teamworks")
 
     run(
         lympik_client=LympikClient(),
         teamworks_client=TeamworksClient(),
         since_unix=since_unix,
         tz=tz,
+        dry_run=dry_run,
     )
 
 

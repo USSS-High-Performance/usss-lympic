@@ -8,11 +8,26 @@ endpoints has gaps versus their published schema.
 
 import logging
 import os
+from collections import namedtuple
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# What find_existing_events() recovered from /api/v1/synchronise.
+#
+# by_pair: {(str(lympik_event_id), str(teamworks_user_id)): [teamworks event
+#   id, ...]} -- a list because the same pair can legitimately come back more
+#   than once (duplicates already in AMS from earlier manual imports), and the
+#   caller needs to see that rather than have one silently picked for it.
+# events_seen / events_parsed: how many events came back, and how many yielded
+#   both a user id and a Teamworks event id. The gap between them is the
+#   signal that this endpoint's shape has drifted: events_seen > 0 with
+#   events_parsed == 0 means the parser is broken, which is very different
+#   from "these users have no matching entries" and must not be treated as
+#   "nothing exists, create everything".
+ExistingEvents = namedtuple("ExistingEvents", "by_pair events_seen events_parsed raw_responses")
 
 DEFAULT_BATCH_SIZE = 25  # per Teamworks' own sample: start small, raise only after measuring.
 DEFAULT_BASE_URL = "https://usopc.smartabase.com/athlete360-usss"
@@ -67,48 +82,50 @@ class TeamworksClient:
             if not cursor:
                 return users
 
-    def find_existing_event_ids(self, form_name, start_date, user_ids, event_id_field, candidate_event_ids):
-        """Which (event id, Teamworks user id) pairs already have a
-        `form_name` entry in Teamworks on/after start_date, for the given
-        user_ids -- queried fresh from Teamworks itself every run instead of
-        trusting a separately maintained ledger file.
+    def find_existing_events(self, form_name, start_date, user_ids, event_id_field, candidate_event_ids):
+        """Which (Lympik event id, Teamworks user id) pairs already have a
+        `form_name` entry in Teamworks on/after start_date, and the Teamworks
+        event id of each -- queried fresh from Teamworks every run rather than
+        from a ledger file, so there's no local state to lose and entries
+        created any other way (a manual entry, a different script) are seen too.
 
-        Confirmed working shape via a sibling Teamworks AMS integration
-        (different org, same v1 API family): POST /api/v1/synchronise with
+        The Teamworks event id is the point: it's what `existingEventId` needs
+        in order to update an entry in place instead of adding a second one.
+
+        Response shape, confirmed live against this AMS instance by
+        probe_upsert.py (see docs/teamworks-api-reference.md): request
         {"formName", "startDate", "userIds"}, paginated via
-        {"pagination": {"paginate": True, "cursor": ...}} on every page
-        after the first, response events under body["export"]["events"].
-        Not yet confirmed against this specific AMS instance -- every call
-        here dumps its raw response to debug_payloads/synchronise_response.json
-        (see run_pipeline.py) so a shape mismatch can be caught and fixed
-        instead of silently returning nothing.
+        {"pagination": {"paginate": True, "cursor": ...}} on pages after the
+        first; events under body["export"]["events"]; each event's Teamworks id
+        under its own "id"; "userId" a bare int (not the {"userId": N} wrapper
+        the import endpoints take); and our own "Event ID" among row 0's pairs.
 
-        userIds is mandatory on this endpoint: omitting it returns no
-        events for anyone, not "all events" -- so empty user_ids or
-        candidate_event_ids always short-circuits rather than risking a
-        call that would silently mean something different than intended.
+        userIds is mandatory here: omitting it returns no events for anyone
+        rather than "all events" -- so empty user_ids or candidate_event_ids
+        short-circuits instead of making a call that would quietly mean
+        something else.
 
-        event_id_field is the row-0 field name holding our event id (e.g.
-        "Event ID") -- checked first on each returned event.
-        candidate_event_ids is the specific set of ids being asked about
-        this run; if the row-0 lookup doesn't land on one of them, every
-        string leaf in the event is checked against the same set as a
-        fallback, since these are distinctive UUIDs unlikely to appear by
-        accident.
+        event_id_field is the row-0 field holding our Lympik event id, checked
+        first. If it doesn't land on one of candidate_event_ids, every string
+        leaf in the event is checked against that set as a fallback -- these
+        are distinctive UUIDs, so a stray match is implausible. Note that AMS
+        also derives a "Lympik Activity URL" field containing the same id, so
+        the fallback can match on that; harmless, since it identifies the same
+        event.
 
-        Returns (found, raw_responses): found is a set of
-        (str(event_id), str(teamworks_user_id)) pairs -- both sides
-        stringified since this endpoint's id types aren't confirmed to
-        match usersynchronise's exactly. raw_responses is the list of raw
-        response bodies (one per page), for the caller to dump for
-        inspection.
+        Returns an ExistingEvents. Ids in by_pair are stringified on the key
+        side (this endpoint's id types aren't guaranteed to match
+        usersynchronise's) but left as-returned on the value side, since
+        that value goes straight back out as existingEventId.
         """
         candidate_ids = {str(cid) for cid in candidate_event_ids}
         if not candidate_ids or not user_ids:
-            return set(), []
+            return ExistingEvents({}, 0, 0, [])
 
-        found = set()
+        by_pair = {}
         raw_responses = []
+        events_seen = 0
+        events_parsed = 0
         cursor = None
         base_body = {
             "formName": form_name,
@@ -132,26 +149,41 @@ class TeamworksClient:
 
             export = page.get("export") or {}
             for event in export.get("events", []):
+                events_seen += 1
+
+                user_id = _event_user_id(event)
+                teamworks_event_id = _event_teamworks_id(event)
+                if user_id is None or teamworks_event_id is None:
+                    # Counted as seen but not parsed: an event we can't
+                    # address is exactly the case that must not be mistaken
+                    # for "this event doesn't exist yet".
+                    continue
+                events_parsed += 1
+
                 event_id = _extract_field_value(event, event_id_field)
                 if str(event_id) not in candidate_ids:
                     event_id = next((v for v in _walk_strings(event) if v in candidate_ids), None)
-                user_id = _event_user_id(event)
-                if event_id is not None and user_id is not None:
-                    found.add((str(event_id), str(user_id)))
+                if event_id is None:
+                    continue
+
+                by_pair.setdefault((str(event_id), str(user_id)), []).append(teamworks_event_id)
 
             cursor = page.get("cursor") or export.get("cursor")
             if not cursor:
                 break
 
-        events_seen = sum(len((p.get("export") or {}).get("events", [])) for p in raw_responses)
-        if events_seen and not found:
-            logger.warning(
-                "synchronise returned %d event(s) for these users but none matched a known "
-                "event id/user id shape -- check debug_payloads/synchronise_response.json",
+        for ids in by_pair.values():
+            ids[:] = _sorted_ids(ids)
+
+        if events_seen and not events_parsed:
+            logger.error(
+                "synchronise returned %d event(s) but none yielded both a user id and an event id -- "
+                "this endpoint's response shape has changed; check "
+                "debug_payloads/synchronise_response.json",
                 events_seen,
             )
 
-        return found, raw_responses
+        return ExistingEvents(by_pair, events_seen, events_parsed, raw_responses)
 
     def bulk_import_events(self, events, batch_size=DEFAULT_BATCH_SIZE):
         """POSTs /api/v1/eventsimport in batches of `batch_size`.
@@ -278,9 +310,31 @@ def _walk_strings(node):
 
 
 def _event_user_id(event):
-    """userId comes back as {"userId": N} in every request shape this
-    client sends -- try that first, then a bare value as a fallback."""
+    """The import endpoints take {"userId": N}, but synchronise responses
+    return a bare int (confirmed live) -- handle both, since the same helper
+    reads both directions."""
     raw = event.get("userId")
     if isinstance(raw, dict):
         return raw.get("userId")
     return raw
+
+
+def _event_teamworks_id(event):
+    """The AMS-side event id, which an update sends back as
+    `existingEventId`. Confirmed to be `id` on this instance; the aliases
+    are cheap insurance and cost nothing when `id` is present."""
+    for key in ("id", "eventId", "existingEventId", "event_id"):
+        value = event.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _sorted_ids(ids):
+    """Lowest first, so a pair with duplicate entries resolves to the oldest
+    (lowest-numbered) one deterministically. Falls back to string ordering if
+    a response ever mixes id types, which would otherwise raise."""
+    try:
+        return sorted(ids)
+    except TypeError:
+        return sorted(ids, key=str)
