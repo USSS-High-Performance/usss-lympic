@@ -232,6 +232,41 @@ def events_from_pages(pages):
     return events
 
 
+def describe_event(event):
+    """Compact structural summary: which keys each row carries, in order.
+    Printed instead of dumping whole unrelated events -- the field *names*
+    and row layout are what the upsert has to get right, and a full dump of
+    every athlete's history buries them."""
+    summary = {}
+    for row in event.get("rows", []):
+        summary[row.get("row")] = [pair.get("key") for pair in row.get("pairs", [])]
+    return summary
+
+
+def print_event_structure(label, event):
+    print(f"\n{label}: Teamworks id {event.get('id')}, userId {event.get('userId')}")
+    structure = describe_event(event)
+    print(f"  rows returned: {sorted(k for k in structure if k is not None)}")
+    for row_index in sorted(structure, key=lambda k: (k is None, k)):
+        keys = structure[row_index]
+        print(f"  row {row_index} ({len(keys)} field(s)): {keys}")
+    return structure
+
+
+def all_keys(event):
+    return {pair.get("key") for row in event.get("rows", []) for pair in row.get("pairs", [])}
+
+
+def pairs_map(event):
+    """key -> list of values across all rows, for spotting which fields AMS
+    populated on its own versus which came from our payload."""
+    values = {}
+    for row in event.get("rows", []):
+        for pair in row.get("pairs", []):
+            values.setdefault(pair.get("key"), []).append(pair.get("value"))
+    return values
+
+
 def report_shape(pages, fake_event_id, teamworks_event_id):
     print("\n=== SHAPE ANALYSIS ===")
     for i, page in enumerate(pages):
@@ -322,12 +357,20 @@ def main():
 
     print("\n=== PHASE 2: read back via /api/v1/synchronise ===")
     pages = synchronise(client, user_id, start_date)
-    for i, page in enumerate(pages):
-        dump(f"raw synchronise response page[{i}]", page)
     events = report_shape(pages, fake_event_id, created_id)
 
     after_create = matching_events(events, fake_event_id)
     print(f"\nentries carrying this Event ID after create: {len(after_create)} (expected 1)")
+
+    # Only this probe's own event gets dumped in full. Dumping every page
+    # means dumping this athlete's whole Lympik Event history, which buries
+    # the field names the upsert actually has to get right.
+    created_structure = None
+    created_keys = set()
+    for _, event in after_create:
+        created_structure = print_event_structure("AFTER CREATE", event)
+        created_keys = all_keys(event)
+        dump("this probe's event as returned by synchronise (after create)", event)
 
     print("\n=== PHASE 3: update (3 runs + changed Fastest Time, existingEventId set) ===")
     runs.append(("probe-run-3", started_at + 600, [10.50, 11.80, 12.90], 35.20, False))
@@ -358,8 +401,6 @@ def main():
 
     print("\n=== PHASE 4: re-read to confirm no duplicate ===")
     pages_after = synchronise(client, user_id, start_date)
-    for i, page in enumerate(pages_after):
-        dump(f"raw synchronise response after update page[{i}]", page)
     events_after = events_from_pages(pages_after)
     after_update = matching_events(events_after, fake_event_id)
 
@@ -385,6 +426,47 @@ def main():
         print(f"event {teamworks_id}: 'probe-run-3' present: {bool(run_ids)}")
         fastest = find_paths(event, "35.2") or find_paths(event, "35.20")
         print(f"event {teamworks_id}: updated Fastest Time (35.20) present: {bool(fastest)}")
+
+    # The upsert sends full state and `existingEventId` replaces the event
+    # wholesale, so what matters is whether a field the payload never
+    # mentions survives that replace. Existing entries on this form carry
+    # fields the pipeline doesn't send (Discipline, Run Time, Total Runs,
+    # SL Prep Z-Score, ...); if those are AMS-side calculations they should
+    # reappear after an update, and if they don't, the upsert is silently
+    # destroying them.
+    print("\n=== PHASE 6: which fields survive a full-replace update? ===")
+    sent_keys = {pair["key"] for row in update_payload["rows"] for pair in row["pairs"]}
+    print(f"keys this probe actually sent ({len(sent_keys)}): {sorted(sent_keys)}")
+
+    for teamworks_id, event in after_update:
+        updated_structure = print_event_structure("AFTER UPDATE", event)
+        updated_keys = all_keys(event)
+
+        print(f"\n  fields present but NOT sent by us (AMS-side, calculated or defaulted):")
+        for key in sorted(updated_keys - sent_keys):
+            print(f"    {key} = {pairs_map(event).get(key)}")
+
+        print(f"\n  fields we sent but absent from the response:")
+        missing = sorted(sent_keys - updated_keys)
+        print(f"    {missing if missing else '(none -- everything we sent came back)'}")
+
+        if created_keys:
+            lost = sorted(created_keys - updated_keys)
+            gained = sorted(updated_keys - created_keys)
+            print(f"\n  present after create but GONE after update: {lost if lost else '(none)'}")
+            print(f"  new after update: {gained if gained else '(none)'}")
+            if created_structure != updated_structure:
+                print("  NOTE: row layout changed between create and update (see structures above)")
+
+        # Called out specifically: existing entries show `Discipline`, while
+        # this pipeline writes `api_discipline`. If both exist on the form,
+        # the pipeline may be filling a raw field while the one reports read
+        # stays empty.
+        values = pairs_map(event)
+        print(f"\n  'api_discipline' (what the pipeline sends) = {values.get('api_discipline', '<absent>')}")
+        print(f"  'Discipline' (what existing entries carry)  = {values.get('Discipline', '<absent>')}")
+
+        dump("this probe's event as returned by synchronise (after update)", event)
 
     print("\n=== CLEANUP ===")
     print("Fake AMS entries created by this probe -- delete these in AMS when done:")
