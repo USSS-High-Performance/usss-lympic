@@ -2,3 +2,4 @@ Touch this file and push to run the pipeline in dry-run mode.
 Temporary; delete before merging.
 post-live-run check: confirm still exactly 5 entries, same ids, no duplicates
 check the Guest naming against live data before writing it
+inspect anonymous runs: are labels ever populated, and what is the 15.42 run

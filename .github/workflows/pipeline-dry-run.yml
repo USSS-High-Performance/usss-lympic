@@ -27,6 +27,14 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # TEMPORARY, goes with the rest of the branch scaffolding: read-only look
+      # at the anonymous runs behind the "Guest - {label}" change -- whether
+      # `label` is ever populated, and what the suspiciously fast anonymous
+      # fastest run actually is. Lympik only, writes nothing.
+      - run: python inspect_anonymous_runs.py
+        env:
+          LYMPIK_PROFILE_ID: ${{ secrets.LYMPIK_PROFILE_ID }}
+          LYMPIK_API_KEY: ${{ secrets.LYMPIK_API_KEY }}
       - run: python run_pipeline.py
         env:
           PIPELINE_DRY_RUN: "1"
