@@ -166,8 +166,14 @@ it already wrote — including each event's AMS event id, which is what
 `existingEventId` needs to update an event rather than add another one.
 
 Not in the published docs; the request shape came from a sibling AMS integration and
-the response shape below was **confirmed live against this instance** by
-`probe_upsert.py`.
+the response shape below was **confirmed live against this instance** by a one-off
+probe that wrote fake data for a single athlete and read it back.
+
+That probe (`probe_upsert.py`) was removed once it had served its purpose — it is
+not part of the pipeline and writing test events into a production athlete
+database is not something to leave a button for. If Teamworks changes this
+endpoint and it needs re-running, recover it from git history rather than
+rewriting it: `git show 5af07c5:probe_upsert.py > probe_upsert.py`.
 
 - **Endpoint**: `POST /api/v1/synchronise`
 - **Auth**: HTTP Basic (AMS username/password)
