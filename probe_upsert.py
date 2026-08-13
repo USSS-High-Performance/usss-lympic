@@ -44,8 +44,11 @@ from athlete_matching import match_athletes, teamworks_user_id
 from run_pipeline import EVENT_ID_FIELD, FORM_NAME, RUNS_DF_COLUMNS, _build_rows_payload
 from teamworks_client import TeamworksAmsError, TeamworksClient
 
-PROBE_FIRST_NAME = os.environ.get("PROBE_FIRST_NAME", "Katie")
-PROBE_LAST_NAME = os.environ.get("PROBE_LAST_NAME", "Hensien")
+# `or` rather than a get() default: on a push-triggered run the workflow sets
+# these from workflow_dispatch inputs that don't exist, so they arrive set but
+# empty -- which a get() default would happily pass through as an empty name.
+PROBE_FIRST_NAME = os.environ.get("PROBE_FIRST_NAME") or "Katie"
+PROBE_LAST_NAME = os.environ.get("PROBE_LAST_NAME") or "Hensien"
 PROBE_SESSION_NAME = "ZZ TEST - Lympik upsert probe (safe to delete)"
 
 # Redacted before anything is printed: this probe dumps whole raw API
