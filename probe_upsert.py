@@ -98,7 +98,16 @@ def scrub(node):
     return node
 
 
+# Full JSON dumps are hundreds of log lines each and bury the compact
+# per-phase verdicts, which are the actual output of this probe. Off by
+# default; set PROBE_FULL_DUMP=1 when a specific value needs eyeballing.
+FULL_DUMP = os.environ.get("PROBE_FULL_DUMP") == "1"
+
+
 def dump(label, payload):
+    if not FULL_DUMP:
+        print(f"\n----- {label}: suppressed, set PROBE_FULL_DUMP=1 to print -----")
+        return
     print(f"\n----- {label} -----")
     print(json.dumps(scrub(payload), indent=2, default=str))
 
