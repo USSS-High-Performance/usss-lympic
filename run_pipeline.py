@@ -164,9 +164,16 @@ def _compute_event_fastest(raw_groups):
     of ~35s completed runs, and won.
 
     Ties go to the later startedAt: a later run means a rougher course and so
-    a comparatively faster time. Returns ("Anon", time) if the fastest run's
-    profile has no name (or no profile at all -- a device-labelled run), or
-    (None, None) if the event has no completed runs."""
+    a comparatively faster time. Returns (None, None) if the event has no
+    completed runs.
+
+    An anonymous fastest run -- no profile at all (a device-labelled run) or a
+    profile carrying no name -- is reported as "Guest", or "Guest - {label}"
+    when the run has a `label` to identify it by (the device/bib text Lympik
+    records instead of a profile, e.g. "G5 AND"). Naming the label matters
+    precisely because these are the runs nobody can otherwise identify: a bare
+    "Guest" holding the event's fastest time is a dead end for whoever reads
+    the entry later."""
     completed = [g for g in raw_groups if g.get("totalDuration") is not None and g.get("invalid") is None]
     if not completed:
         return None, None
@@ -175,9 +182,15 @@ def _compute_event_fastest(raw_groups):
 
     profile = fastest.get("profile") or {}
     name_parts = [p for p in (profile.get("firstName"), profile.get("lastName")) if p]
-    name = " ".join(name_parts) if name_parts else "Anon"
+    if name_parts:
+        return " ".join(name_parts), fastest["totalDuration"]
 
-    return name, fastest["totalDuration"]
+    # str() before strip(): `label` is untyped in Lympik's schema, so a
+    # numeric bib would otherwise blow up on .strip(). Whitespace-only is
+    # treated as blank, since "Guest - " reads as a bug.
+    label = str(fastest.get("label") or "").strip()
+
+    return (f"Guest - {label}" if label else "Guest"), fastest["totalDuration"]
 
 
 def _write_debug_payload(event_id, module, teamworks_user_id_value, lympik_profile, event, alpine_event, event_fields, raw_groups, raw_athlete_groups, athlete_runs_df, ams_event):
@@ -236,7 +249,7 @@ def _write_debug_payload(event_id, module, teamworks_user_id_value, lympik_profi
                 "Wind Speed": "alpine_event['windSpeed'] -- blank unless module is event:alpine-skiing",
                 "Humidity": "alpine_event['humidity'] -- blank unless module is event:alpine-skiing",
                 "Snow Temp": "alpine_event['snowTemperature'] -- blank unless module is event:alpine-skiing",
-                "Fastest Athlete": "_compute_event_fastest(raw_groups) -- min totalDuration across all runs in the event that aren't flagged `invalid`, ties broken by later startedAt, 'Anon' if no profile name",
+                "Fastest Athlete": "_compute_event_fastest(raw_groups) -- min totalDuration across all runs in the event that aren't flagged `invalid`, ties broken by later startedAt; an anonymous run becomes 'Guest - {label}', or 'Guest' if it has no label",
                 "Fastest Time": "_compute_event_fastest(raw_groups) -- the winning run's totalDuration",
             },
             "data": event_fields,

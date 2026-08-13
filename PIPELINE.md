@@ -138,10 +138,17 @@ dumps, logs the plan, sends nothing.
 
    `_compute_event_fastest()` separately scans the *unfiltered* run list
    (including unassigned runs) for two more row-0 fields: `Fastest Athlete` (the
-   name off the fastest completed run's profile, or `"Anon"` if that run has no
-   profile/name; ties go to the later `startedAt`, since a later run implies a
-   rougher course and so a comparatively faster time) and `Fastest Time` (that
-   run's `totalDuration`). Runs flagged `invalid` are excluded here as well as
+   name off the fastest completed run's profile; ties go to the later
+   `startedAt`, since a later run implies a rougher course and so a
+   comparatively faster time) and `Fastest Time` (that run's `totalDuration`).
+
+   An anonymous fastest run — no profile at all (a device-labelled run) or a
+   profile carrying no name — is reported as **`Guest - {label}`**, falling back
+   to plain **`Guest`** when the run has no `label` (blank, whitespace-only, or
+   absent). `label` is the device/bib text Lympik records in place of a profile,
+   e.g. `"G5 AND"`. Including it matters most for exactly these runs: they're
+   the ones nobody can otherwise identify, so a bare name on the event's fastest
+   time would be a dead end for whoever reads the entry later. Runs flagged `invalid` are excluded here as well as
    runs with no `totalDuration` at all: an invalid run can still carry a
    *partial* `totalDuration` covering only part of the course, which then beats
    every completed run. A timing event showed this directly — a
