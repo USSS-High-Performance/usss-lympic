@@ -303,6 +303,17 @@ def _write_debug_synchronise_response(existing, plan):
     (DEBUG_DUMP_DIR / "synchronise_response.json").write_text(json.dumps(dump, indent=2, default=str))
 
 
+def _row_0_value(ams_event, key):
+    """Read one row-0 field back off a built payload -- so the dry-run plan can
+    report the values it would write, not just which events it would touch."""
+    for row in ams_event.get("rows", []):
+        if row.get("row") == 0:
+            for pair in row.get("pairs", []):
+                if pair.get("key") == key:
+                    return pair.get("value")
+    return None
+
+
 def _build_rows_payload(event_fields, athlete_runs_df):
     rows = [{"row": 0, "pairs": [{"key": k, "value": _stringify(v)} for k, v in event_fields.items()]}]
 
@@ -534,6 +545,8 @@ def run(lympik_client, teamworks_client, since_unix, tz, dry_run=False):
                 "action": payload["action"],
                 "existingEventId": payload["ams_event"].get("existingEventId"),
                 "other_existing_ids": existing_ids[1:],
+                "fastest_athlete": _row_0_value(payload["ams_event"], "Fastest Athlete"),
+                "fastest_time": _row_0_value(payload["ams_event"], "Fastest Time"),
             }
         )
 
@@ -550,11 +563,14 @@ def run(lympik_client, teamworks_client, since_unix, tz, dry_run=False):
     if dry_run:
         for entry in plan:
             logger.info(
-                "DRY RUN: would %s event %s for %s (existingEventId=%s)",
+                "DRY RUN: would %s event %s for %s (existingEventId=%s) "
+                "-- Fastest Athlete=%r, Fastest Time=%r",
                 entry["action"],
                 entry["event_id"],
                 entry["athlete"],
                 entry["existingEventId"],
+                entry["fastest_athlete"],
+                entry["fastest_time"],
             )
         logger.info("DRY RUN: nothing was sent to Teamworks")
         return
