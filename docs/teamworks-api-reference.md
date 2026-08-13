@@ -159,6 +159,71 @@ Response:
 - Sort events chronologically (oldest first) before batching, to minimize
   re-triggering any historical calculations on the AMS side.
 
+## v1: Export Event Data — `/api/v1/synchronise`
+
+**Purpose**: reads back existing events for a form, so an integration can find what
+it already wrote — including each event's AMS event id, which is what
+`existingEventId` needs to update an event rather than add another one.
+
+Not in the published docs; the request shape came from a sibling AMS integration and
+the response shape below was **confirmed live against this instance** by
+`probe_upsert.py`.
+
+- **Endpoint**: `POST /api/v1/synchronise`
+- **Auth**: HTTP Basic (AMS username/password)
+- **Required query params**: `informat=json`, `format=json`
+
+Request body:
+```json
+{
+  "formName": "My Event Form",
+  "startDate": "13/08/2026",
+  "userIds": [12791],
+  "pagination": { "paginate": true, "cursor": "<cursor from previous page>" }
+}
+```
+- `userIds` is **mandatory**. Omitting it returns no events for anyone — not "all
+  events". A caller that means "everyone" has to enumerate users itself.
+- `startDate` is `dd/MM/yyyy`, inclusive, with no upper bound.
+- Omit `pagination` on the first request; send it on each subsequent page.
+
+Response:
+```json
+{
+  "export": {
+    "events": [
+      {
+        "formName": "Lympik Event",
+        "startDate": "13/08/2026",
+        "startTime": "10:54 AM",
+        "finishDate": "13/08/2026",
+        "finishTime": "11:54 AM",
+        "userId": 12791,
+        "enteredByUserId": 23936,
+        "rows": [ { "row": 0, "pairs": [ { "key": "Event ID", "value": "..." } ] } ],
+        "id": 2875223
+      }
+    ]
+  },
+  "lastSynchronisationTimeOnServer": 1786643797049,
+  "idsOfDeletedEvents": [2593156, 2593163]
+}
+```
+- **`id` is the AMS event id** — pass it back as `existingEventId` to update that
+  event.
+- **`userId` is a bare int here**, not the `{"userId": N}` wrapper the import
+  endpoints require. Same field name, different shape by direction.
+- **Response rows are not request rows.** An import sends row 0 as event-level
+  fields only, with table rows after it; the response comes back with row 0
+  holding the event-level fields **merged with the first table row**, then one row
+  per remaining table row. A 3-run event imported as rows 0-3 reads back as rows
+  0-2.
+- Values reflect the form's own field types after AMS-side calculation, so expect
+  fields you never sent (see `docs/teamworks-ams-notes.md`) and reformatted values
+  (a number field may read back as `"1.78432026E9"`).
+- `cursor` for the next page appears at the top level or under `export`; absent or
+  null on the last page.
+
 ## Practical notes
 
 - **Creating new objects**: use `{"id": -1}`. Don't use a specific ID for a new object

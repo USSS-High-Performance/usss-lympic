@@ -32,16 +32,21 @@ recorded on either one produces the same runs-and-sections data.
    - For each matched athlete, sort their runs oldest-to-newest, number them
      `Run #`, and build one Teamworks event payload: the session's shared fields
      in row 0, one table row per run after that.
-4. **Skip anything already uploaded.** Before uploading, the pipeline asks
-   Teamworks itself which (event, athlete) pairs already have a "Lympik
-   Event" entry (`POST /api/v1/synchronise`, matching on the "Event ID"
-   field every upload writes into row 0) and skips those. No local state
-   file — Teamworks is the source of truth, queried fresh every run. See
-   PIPELINE.md for the one open item here: this endpoint's exact response
-   shape is confirmed against a different Teamworks org, not yet against
-   this one -- check `debug_payloads/synchronise_response.json` after a
-   real run to confirm.
-5. **Upload.** All the pending athlete-events across every Lympik event in this
+4. **Decide create-or-update for each one.** Before uploading, the pipeline asks
+   Teamworks itself which (event, athlete) pairs already have a "Lympik Event"
+   entry (`POST /api/v1/synchronise`, matching on the "Event ID" field every
+   upload writes into row 0) and what each one's Teamworks event id is. A pair
+   already present is **updated in place** via `existingEventId`; a pair that
+   isn't is created. No local state file — Teamworks is the source of truth,
+   queried fresh every run.
+
+   Nothing is skipped: a Lympik session can be read while it's still in
+   progress, so an event already uploaded keeps gaining runs, and the
+   event-wide `Fastest Athlete`/`Fastest Time` fields go stale on *every*
+   athlete's entry when any one of them posts a new best. Everything in the
+   24-hour window is re-sent every run. See PIPELINE.md for what that
+   whole-event replacement does and doesn't preserve (all confirmed live).
+5. **Upload.** All the athlete-events across every Lympik event in this
    run are batched together and sent to Teamworks' `/api/v1/eventsimport` in
    groups of 25. That endpoint fails an entire batch if even one event in it is
    malformed, with no indication of which one — so a batch failure automatically
@@ -100,9 +105,13 @@ jobs:
           TEAMWORKS_USERNAME: ${{ secrets.TEAMWORKS_USERNAME }}
           TEAMWORKS_PASSWORD: ${{ secrets.TEAMWORKS_PASSWORD }}
 ```
-No ledger-persistence concern on GitHub Actions (or anywhere else): duplicate
-detection is a live Teamworks query on every run, not a state file that could
-be lost on an ephemeral runner disk.
+No ledger-persistence concern on GitHub Actions (or anywhere else): finding
+existing entries is a live Teamworks query on every run, not a state file that
+could be lost on an ephemeral runner disk.
+
+Set `PIPELINE_DRY_RUN=1` to do everything except the upload — read Lympik,
+build every payload, resolve create-vs-update against Teamworks, write the
+debug dumps, log the plan, send nothing.
 
 I haven't created the workflow file itself since that wasn't asked for -- say
 the word and I'll add it for real.
@@ -133,11 +142,16 @@ needs changing if you have a specific reason to.
 - `lympik_activity.py` — turns an activity-search response into a deduplicated
   list of event ids (step 1 of the flow).
 - `teamworks_client.py` — Teamworks AMS API client. `list_athletes()` walks the
-  paginated user-sync endpoint; `find_existing_event_ids()` queries which
-  (event, athlete) pairs already have a "Lympik Event" entry
+  paginated user-sync endpoint; `find_existing_events()` queries which
+  (event, athlete) pairs already have a "Lympik Event" entry and each one's
+  Teamworks event id, for updating in place
   (`POST /api/v1/synchronise`); `bulk_import_events()` submits events in
   batches and handles the all-or-nothing-per-batch failure mode by retrying
   individually.
+- `probe_upsert.py` — one-off live probe that confirmed the synchronise response
+  shape and `existingEventId` behavior on this AMS instance, by writing fake
+  data for one athlete and reading it back. Not part of the pipeline; run
+  manually via its own workflow. See PIPELINE.md for what it established.
 - `athlete_matching.py` — the name-matching cascade (last name → first initial
   → full first name) between a Lympik athlete name and the Teamworks roster,
   plus small helpers for Teamworks' inconsistent field naming

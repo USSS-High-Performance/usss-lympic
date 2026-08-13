@@ -1,0 +1,46 @@
+name: Probe - confirm synchronise shape and existingEventId behavior
+
+# Manual only, never scheduled. Writes fake test data into the live AMS
+# "Lympik Event" form against one athlete, then reports the ids to delete --
+# see probe_upsert.py. Run this before shipping the upsert change, to confirm
+# the two live behaviors that change depends on.
+#
+# TEMPORARY push trigger: workflow_dispatch only registers for workflows
+# already on the default branch, so a new workflow on a feature branch cannot
+# be dispatched at all (404). A push trigger runs the branch's own copy of the
+# file with no such requirement. Scoped to `.probe-trigger` so it fires only
+# when that file is deliberately touched, not on every push to the branch.
+# Remove this `push:` block (and `.probe-trigger`) before merging -- the
+# workflow_dispatch below is the permanent entry point once this is on main.
+on:
+  push:
+    branches:
+      - claude/lympik-alpine-skiing-404-3vngw0
+    paths:
+      - .probe-trigger
+  workflow_dispatch:
+    inputs:
+      first_name:
+        description: "Athlete first name to write fake test data against"
+        required: false
+        default: "Katie"
+      last_name:
+        description: "Athlete last name to write fake test data against"
+        required: false
+        default: "Hensien"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python probe_upsert.py
+        env:
+          TEAMWORKS_USERNAME: ${{ secrets.TEAMWORKS_USERNAME }}
+          TEAMWORKS_PASSWORD: ${{ secrets.TEAMWORKS_PASSWORD }}
+          PROBE_FIRST_NAME: ${{ inputs.first_name }}
+          PROBE_LAST_NAME: ${{ inputs.last_name }}

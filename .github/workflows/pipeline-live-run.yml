@@ -1,0 +1,33 @@
+name: Pipeline LIVE run (writes to AMS)
+
+# Runs the real pipeline against live Teamworks with no dry-run guard -- this
+# WRITES to AMS. Deliberately a separate file from pipeline-dry-run.yml rather
+# than a flag on it, so a live run can never happen by flipping one env value.
+#
+# TEMPORARY, and the whole file goes before merging: it exists only to exercise
+# the upsert from this branch, because workflow_dispatch on a branch-only
+# workflow returns 404 and the scheduled pipeline.yml runs main's code. Once
+# this is merged, the scheduled pipeline.yml is the live path and this file has
+# no reason to exist.
+on:
+  push:
+    branches:
+      - claude/lympik-alpine-skiing-404-3vngw0
+    paths:
+      - .liverun-trigger
+
+jobs:
+  live-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python run_pipeline.py
+        env:
+          LYMPIK_PROFILE_ID: ${{ secrets.LYMPIK_PROFILE_ID }}
+          LYMPIK_API_KEY: ${{ secrets.LYMPIK_API_KEY }}
+          TEAMWORKS_USERNAME: ${{ secrets.TEAMWORKS_USERNAME }}
+          TEAMWORKS_PASSWORD: ${{ secrets.TEAMWORKS_PASSWORD }}

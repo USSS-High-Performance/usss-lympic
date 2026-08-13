@@ -1,0 +1,4 @@
+Touch this file and push to run .github/workflows/probe-upsert.yml.
+Temporary; delete along with the probe before merging.
+run 2 - field survival + row layout under full-replace update
+run 3 - compact log, read the create-vs-update field diff

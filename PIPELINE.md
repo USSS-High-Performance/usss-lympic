@@ -8,10 +8,10 @@ supersedes the earlier, more abstract 6-step plan this doc used to describe.
 | Step | Status |
 |---|---|
 | 1. Get recent event IDs from Lympik | Done — `lympik_activity.py: get_recent_event_ids()` |
-| 2. Pull existing "Lympik Event" entries from Teamworks | Done — `teamworks_client.py: TeamworksClient.find_existing_event_ids()` |
-| 3. Get unique Event IDs already in Teamworks | Done — same call, see below |
+| 2. Pull existing "Lympik Event" entries from Teamworks | Done — `teamworks_client.py: TeamworksClient.find_existing_events()` |
+| 3. Get unique Event IDs already in Teamworks, and their Teamworks event ids | Done — same call, see below |
 | 4. Get all Teamworks athletes | Done — `teamworks_client.py: TeamworksClient.list_athletes()` |
-| 5. Filter to (event, athlete) pairs not yet uploaded | Done — `run_pipeline.py: run()` |
+| 5. Resolve each (event, athlete) pair to create-or-update | Done — `run_pipeline.py: run()` |
 | 6. Per event: pull data, build per-athlete runs, match, upload | Done — `run_pipeline.py` |
 
 Everything under "Done" was exercised against mock HTTP servers seeded with the
@@ -29,34 +29,84 @@ reachable via the `activity.search` key scope. `lympik_client.py`'s
 returns the deduplicated event ids from the response. Only `dateFrom` is used
 (no upper bound) — confirmed this always looks forward from that point to now.
 
-## Steps 2-3: which events are already in Teamworks — solved
+## Steps 2-3: which events are already in Teamworks — solved, confirmed live
 
 This used to be a stopgap: a local JSON ledger file tracking what *this script*
 had uploaded, since no query endpoint was known. That's gone now. Teamworks
 itself is the source of truth, queried fresh every run via
-`TeamworksClient.find_existing_event_ids()` (`POST /api/v1/synchronise`):
-confirmed working shape from a sibling Teamworks AMS integration (different
-org, same v1 API family) — request `{"formName", "startDate", "userIds"}`,
-paginated via `{"pagination": {"paginate": True, "cursor": ...}}` on every page
-after the first, response events under `body["export"]["events"]`.
+`TeamworksClient.find_existing_events()` (`POST /api/v1/synchronise`) — request
+`{"formName", "startDate", "userIds"}`, paginated via
+`{"pagination": {"paginate": True, "cursor": ...}}` on every page after the
+first, response events under `body["export"]["events"]`.
 
-Each returned event's row-0 pairs are checked for our own `"Event ID"` field
-(the same field every upload writes into row 0) to recover the Lympik event id,
-and `event["userId"]` for which athlete it belongs to — giving back a set of
-`(event_id, teamworks_user_id)` pairs already present, which `run()` filters
-`all_payloads` against before uploading.
+Each returned event yields three things: the Lympik event id from row 0's own
+`"Event ID"` field (the same field every upload writes), the athlete from
+`event["userId"]`, and **the Teamworks event id from `event["id"]`** — that
+last one is what `existingEventId` needs in order to update the entry instead
+of adding a second one.
 
-**Not yet confirmed against this specific AMS instance** — only against a
-different org's. Every call dumps its raw response to
-`debug_payloads/synchronise_response.json`, and `find_existing_event_ids()`
-logs a warning if events come back but none parse into a recognized shape, so
-a mismatch is visible immediately instead of silently uploading duplicates.
-Confirm this against a real run before trusting it fully; if the shape turns
-out to differ, the fix is isolated to `_extract_field_value()` /
-`_event_user_id()` in `teamworks_client.py`.
+**Confirmed live against this AMS instance** by `probe_upsert.py` (see
+"Upsert" below), which also pinned down two details that differ from the
+import direction:
+
+- `userId` comes back as a bare int (`"userId": 12791`), not the
+  `{"userId": N}` wrapper the import endpoints require.
+- Response rows are *not* request rows: row 0 comes back with the event-level
+  fields **merged with the first run's data**, then one row per remaining run.
+  Reading `"Event ID"` from row 0 is unaffected.
+
+Every call still dumps its raw response and the resulting plan to
+`debug_payloads/synchronise_response.json`. If events come back but none can be
+matched to both an athlete and an event id, that means the response shape has
+drifted — `run()` logs an error and **aborts before uploading** rather than
+treating "lookup broken" as "nothing exists yet", which would duplicate every
+entry in the window, every 30 minutes.
 
 This also removes the GitHub Actions ephemeral-disk risk the ledger used to
 carry (see README) — there's no local state to lose between runs anymore.
+
+## Upsert: in-progress sessions keep updating
+
+A Lympik session can be read while it's still running, so an event already
+uploaded will keep gaining runs. Every athlete-session in the lookback window
+is therefore re-sent on every run and updates its existing entry in place. An
+earlier version skipped anything already present, which froze each entry at
+whatever the session looked like the first time it was seen.
+
+Re-sending athletes whose own runs didn't change is deliberate: row 0's
+`Fastest Athlete`/`Fastest Time` are event-wide, so a new best by any athlete
+makes every other athlete's entry for that session stale.
+
+`existingEventId` replaces an event's contents rather than merging them, and
+this form carries a dozen fields the pipeline never sends. `probe_upsert.py`
+confirmed live that all of them are AMS-side derivations that recompute after
+an update — nothing present after a create was missing after an update:
+
+| Field | Derived from |
+|---|---|
+| `Discipline` | `api_discipline` (so the pipeline writes the right field) |
+| `Lympik Activity URL` | `Event ID` |
+| `name_stripped` | `Session Name` |
+| `Run Time` | `run_time`, formatted to 2dp |
+| `Total Runs`, `Session Total Time (s)`, `# DNF`, `Session % DNF` | the run rows |
+| `Date Year`, `Period`, `Period Calc Number`, `7 Day Total Time in Course` | AMS-side calcs |
+
+Two further confirmations from the same probe: `eventsimport` (plural, which
+this pipeline batches through) honors `existingEventId` even though only the
+singular `eventimport` documents it, and an update returns the *same* event id
+it replaced. That last point is load-bearing — `eventsimport` reports success
+either way, so a returned id that differs from the `existingEventId` sent is
+the only signal that it created a duplicate instead of updating. `run()`
+checks every update for exactly that and logs the stray id for deletion.
+
+Where a pair already has more than one entry in AMS (duplicates from earlier
+manual imports — Event ID `testtest` has two), the lowest id is updated and the
+rest are logged by id for manual deletion. Deleting another system's records
+isn't this pipeline's call.
+
+`PIPELINE_DRY_RUN=1` does everything except the upload: reads Lympik, builds
+every payload, resolves create-vs-update against Teamworks, writes the debug
+dumps, logs the plan, sends nothing.
 
 ## Step 4: all Teamworks athletes — solved
 
@@ -88,10 +138,17 @@ carry (see README) — there's no local state to lose between runs anymore.
 
    `_compute_event_fastest()` separately scans the *unfiltered* run list
    (including unassigned runs) for two more row-0 fields: `Fastest Athlete` (the
-   name off the fastest completed run's profile, or `"Anon"` if that run has no
-   profile/name; ties go to the later `startedAt`, since a later run implies a
-   rougher course and so a comparatively faster time) and `Fastest Time` (that
-   run's `totalDuration`). Runs flagged `invalid` are excluded here as well as
+   name off the fastest completed run's profile; ties go to the later
+   `startedAt`, since a later run implies a rougher course and so a
+   comparatively faster time) and `Fastest Time` (that run's `totalDuration`).
+
+   An anonymous fastest run — no profile at all (a device-labelled run) or a
+   profile carrying no name — is reported as **`Guest - {label}`**, falling back
+   to plain **`Guest`** when the run has no `label` (blank, whitespace-only, or
+   absent). `label` is the device/bib text Lympik records in place of a profile,
+   e.g. `"G5 AND"`. Including it matters most for exactly these runs: they're
+   the ones nobody can otherwise identify, so a bare name on the event's fastest
+   time would be a dead end for whoever reads the entry later. Runs flagged `invalid` are excluded here as well as
    runs with no `totalDuration` at all: an invalid run can still carry a
    *partial* `totalDuration` covering only part of the course, which then beats
    every completed run. A timing event showed this directly — a
