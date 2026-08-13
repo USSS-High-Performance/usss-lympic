@@ -23,7 +23,8 @@ row-0 "Fastest Athlete"/"Fastest Time" fields are event-wide, so when any
 athlete posts a new best every *other* athlete's entry for that session is
 stale and needs rewriting too, not just the one whose runs changed.
 
-Whole-event replacement is safe here, confirmed live by probe_upsert.py:
+Whole-event replacement is safe here, confirmed live against this AMS instance
+(see PIPELINE.md "Upsert"):
 `existingEventId` replaces an event's contents rather than merging, and this
 form carries a dozen fields the pipeline never sends (Discipline, Run Time,
 Total Runs, Session Total Time (s), # DNF, Session % DNF, Period, Date Year,

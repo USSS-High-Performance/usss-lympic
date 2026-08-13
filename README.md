@@ -109,12 +109,14 @@ No ledger-persistence concern on GitHub Actions (or anywhere else): finding
 existing entries is a live Teamworks query on every run, not a state file that
 could be lost on an ephemeral runner disk.
 
+That workflow is committed at `.github/workflows/pipeline.yml`, so the schedule
+above is what actually runs.
+
 Set `PIPELINE_DRY_RUN=1` to do everything except the upload — read Lympik,
 build every payload, resolve create-vs-update against Teamworks, write the
-debug dumps, log the plan, send nothing.
-
-I haven't created the workflow file itself since that wasn't asked for -- say
-the word and I'll add it for real.
+debug dumps, log the plan, send nothing. Useful before or after a change that
+touches what gets written; run it locally, or add it as an `env:` line to a
+scratch copy of the workflow.
 
 ### Secrets you need in `.env`
 
@@ -148,20 +150,15 @@ needs changing if you have a specific reason to.
   (`POST /api/v1/synchronise`); `bulk_import_events()` submits events in
   batches and handles the all-or-nothing-per-batch failure mode by retrying
   individually.
-- `probe_upsert.py` — one-off live probe that confirmed the synchronise response
-  shape and `existingEventId` behavior on this AMS instance, by writing fake
-  data for one athlete and reading it back. Not part of the pipeline; run
-  manually via its own workflow. See PIPELINE.md for what it established.
 - `athlete_matching.py` — the name-matching cascade (last name → first initial
   → full first name) between a Lympik athlete name and the Teamworks roster,
   plus small helpers for Teamworks' inconsistent field naming
   (`firstName`/`first_name`/`forename`, etc.).
 
 **Reference docs:**
-- `PIPELINE.md` — the detailed design doc: what's solved, real bugs that
-  testing caught before they shipped, and the one open question left
-  (confirming `/api/v1/synchronise`'s exact response shape against this AMS
-  instance, currently only confirmed against a different org's).
+- `PIPELINE.md` — the detailed design doc: how each step works, the upsert and
+  its three anti-duplicate guards, and real bugs that testing caught before
+  they shipped.
 - `docs/teamworks-api-reference.md` — the Teamworks v1 API endpoints this
   project uses (`usersynchronise`, `eventimport`, `eventsimport`), cleaned up
   from Teamworks' own reference material.
@@ -173,19 +170,13 @@ needs changing if you have a specific reason to.
 **Config:**
 - `.env.example` — template for `.env`. Copy it, fill in the four secrets above.
 - `requirements.txt` — `requests`, `python-dotenv`, `pandas`.
-- `.gitignore` — keeps `.env`, `debug_payloads/`, and old exploration output
-  (`samples/`) out of version control.
+- `.gitignore` — keeps `.env` and `debug_payloads/` out of version control.
 
-**Earlier exploration, not part of the live pipeline:**
-- `explore_payloads.py` — the very first script in this project, from before
-  a real event-discovery endpoint was known. Authenticates and dumps sample
-  Lympik payloads to `samples/*.json` for manual inspection. Still useful if
-  you ever need to poke at a new/undocumented Lympik endpoint by hand.
-- `lympik_extract.py` — an earlier, more generic single-event extractor,
-  written before the actual "Lympik Event" form fields were known. Superseded
-  by the more specific `build_runs_dataframe()`/`build_athlete_payloads()` in
-  `run_pipeline.py`. Left in place rather than deleted, but nothing in the
-  current flow calls it.
+Everything tracked here is either run by the pipeline or documents it. Earlier
+exploration scripts (Lympik payload dumping, the oculus HDF5 download and
+CSV conversion, a superseded generic event extractor) and the one-off AMS probe
+were removed once the pipeline was working; they are in git history if a
+future question needs them — `git log --diff-filter=D --name-only` finds them.
 
 ## After a run
 

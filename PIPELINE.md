@@ -45,8 +45,9 @@ Each returned event yields three things: the Lympik event id from row 0's own
 last one is what `existingEventId` needs in order to update the entry instead
 of adding a second one.
 
-**Confirmed live against this AMS instance** by `probe_upsert.py` (see
-"Upsert" below), which also pinned down two details that differ from the
+**Confirmed live against this AMS instance** by a one-off probe (see "Upsert"
+below, and docs/teamworks-api-reference.md for how to recover the probe if this
+ever needs re-checking), which also pinned down two details that differ from the
 import direction:
 
 - `userId` comes back as a bare int (`"userId": 12791`), not the
@@ -78,9 +79,9 @@ Re-sending athletes whose own runs didn't change is deliberate: row 0's
 makes every other athlete's entry for that session stale.
 
 `existingEventId` replaces an event's contents rather than merging them, and
-this form carries a dozen fields the pipeline never sends. `probe_upsert.py`
-confirmed live that all of them are AMS-side derivations that recompute after
-an update — nothing present after a create was missing after an update:
+this form carries a dozen fields the pipeline never sends. The probe confirmed
+live that all of them are AMS-side derivations that recompute after an update —
+nothing present after a create was missing after an update:
 
 | Field | Derived from |
 |---|---|

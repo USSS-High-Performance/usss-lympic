@@ -1,7 +1,5 @@
 .env
-samples/
 __pycache__/
 *.pyc
 .venv/
 debug_payloads/
-*.h5

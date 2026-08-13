@@ -92,8 +92,8 @@ class TeamworksClient:
         The Teamworks event id is the point: it's what `existingEventId` needs
         in order to update an entry in place instead of adding a second one.
 
-        Response shape, confirmed live against this AMS instance by
-        probe_upsert.py (see docs/teamworks-api-reference.md): request
+        Response shape, confirmed live against this AMS instance
+        (see docs/teamworks-api-reference.md): request
         {"formName", "startDate", "userIds"}, paginated via
         {"pagination": {"paginate": True, "cursor": ...}} on pages after the
         first; events under body["export"]["events"]; each event's Teamworks id

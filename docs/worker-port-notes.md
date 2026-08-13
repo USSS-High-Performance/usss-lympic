@@ -239,9 +239,14 @@ run that only names events can't verify a change to a field's value.
 ## 7. Confirmed API behavior — read before coding
 
 Everything here was verified against the live `usopc.smartabase.com/athlete360-usss`
-instance by `probe_upsert.py`, which wrote fake data for one athlete, read it
+instance by a one-off probe, which wrote fake data for one athlete, read it
 back, updated it, and read it back again. Where this contradicts the published
 reference, **this is right and the reference is wrong**.
+
+The probe has since been removed from `usss-lympic` (it is not pipeline code, and
+a button that writes test events into a production athlete database is not worth
+leaving in place). Recover it from git history if the API shifts and this table
+needs re-checking: `git show 5af07c5:probe_upsert.py`.
 
 ### `POST /api/v1/synchronise` (reading events back)
 
@@ -329,8 +334,12 @@ hence push triggers gated on a touch-file):
   `pipeline-live-run.yml`
 - `.probe-trigger`, `.dryrun-trigger`, `.liverun-trigger`
 - `inspect_anonymous_runs.py` — one-off read-only diagnostic
-- `probe_upsert.py` — worth keeping *somewhere* in the org as the tool that
-  re-verifies AMS behavior if the API shifts, but it is not pipeline code
+  (`git show 8ce9e40:inspect_anonymous_runs.py` if the label question resurfaces)
+- `probe_upsert.py` — the tool that re-verifies AMS behavior if the API shifts,
+  but not pipeline code (`git show 5af07c5:probe_upsert.py`)
+
+All of the above have been deleted from `usss-lympic` too, for the same reason —
+so there is nothing here the worker should carry across.
 
 Port the pipeline changes (sections 1–6) and the docs (section 7).
 
