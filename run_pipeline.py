@@ -618,7 +618,7 @@ def main():
 
     # One day back, deliberately short: the upsert re-sends everything in this
     # window on every run, and a Lympik session never spans more than a day.
-    since_unix = int(time.time() - 86400)
+    since_unix = int(time.time() - (86400 * 3))
     tz = ZoneInfo(os.environ.get("PIPELINE_TIMEZONE", "America/Denver"))
 
     # PIPELINE_DRY_RUN=1 does everything except the upload: reads Lympik,
